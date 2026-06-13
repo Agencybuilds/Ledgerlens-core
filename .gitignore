@@ -14,10 +14,12 @@ venv/
 .env
 
 # Data & models (large/binary artifacts, not checked into core)
-data/raw/
-data/processed/
+data/
 models/*.pkl
 models/*.joblib
+
+# Local RiskScore store
+*.db
 
 # Editors
 .vscode/
