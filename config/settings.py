@@ -42,6 +42,7 @@ class Settings:
             if o.strip()
         )
     )
+    admin_api_key: str = field(default_factory=lambda: os.getenv("LEDGERLENS_ADMIN_API_KEY", ""))
 
     def __post_init__(self) -> None:
         weights = (
