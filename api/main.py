@@ -287,6 +287,15 @@ def retrain_runs(
     return get_retrain_runs(limit=limit, model_name=model_name)
 
 
+@app.get("/admin/federated/audit-log", dependencies=[Depends(require_admin_key)])
+def federated_audit_log(
+    limit: int = Query(default=50, ge=1, le=1000),
+) -> list[dict]:
+    """Return the most recent federated-round audit records (participant IDs are SHA-256 hashed)."""
+    from detection.federated.audit import get_audit_records
+    return get_audit_records(limit=limit)
+
+
 # ---------------------------------------------------------------------------
 # Webhook subscriber management
 # ---------------------------------------------------------------------------
