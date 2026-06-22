@@ -292,6 +292,7 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
 ]
 
 
+
 @contextmanager
 def _connect(db_path: str | None = None):
     conn = sqlite3.connect(db_path or settings.db_path)
