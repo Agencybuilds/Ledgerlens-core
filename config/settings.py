@@ -39,6 +39,13 @@ class Settings:
         default_factory=lambda: float(os.getenv("SANDWICH_SCORE_WEIGHT", "0.0"))
     )
 
+    # Fraction of the composite risk score driven by the multivariate (cross-pair)
+    # Benford copula dependence signal (see detection.risk_score.RiskScore.combine).
+    # 0.0 preserves the legacy Benford/ML-only blend.
+    benford_copula_weight: float = field(
+        default_factory=lambda: float(os.getenv("BENFORD_COPULA_WEIGHT", "0.0"))
+    )
+
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 
