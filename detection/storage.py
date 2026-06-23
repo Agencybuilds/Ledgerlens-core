@@ -335,21 +335,20 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         11,
-        "add alerts table for sandwich and manipulation alerts",
+        "add alerts table for typed manipulation alerts",
         """
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alert_type TEXT NOT NULL,
             wallet TEXT NOT NULL,
-            asset_pair TEXT,
+            asset_pair TEXT NOT NULL,
             pool_id TEXT,
-            severity INTEGER NOT NULL DEFAULT 0,
-            detail_json TEXT,
-            created_at TEXT NOT NULL
+            detail_json TEXT NOT NULL,
+            timestamp TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts (alert_type);
         CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
-        CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts (created_at);
+        CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
+        CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp);
         """,
     ),
 ]
@@ -1415,27 +1414,61 @@ def get_bridge_transfer_history(
     ]
 
 
+def sandwich_candidates_to_alerts(candidates, asset_pair: str) -> list[dict]:
+    """Convert `SandwichCandidate` objects into storable alert dicts.
+
+    Each alert is attributed to the attacker account (`wallet`) and carries the
+    sandwich-specific evidence (victim, profit, slippage, ledger ordering) in
+    its ``detail`` payload.  See `detection.sandwich_engine`.
+    """
+    alerts: list[dict] = []
+    for c in candidates:
+        alerts.append(
+            {
+                "alert_type": AlertType.SANDWICH_ATTACK.value,
+                "wallet": c.attacker,
+                "asset_pair": asset_pair,
+                "pool_id": c.pool_id,
+                "detail": {
+                    "victim": c.victim,
+                    "profit_xlm": c.profit_xlm,
+                    "slippage_inflicted": c.slippage_inflicted,
+                    "ledger_sequence": c.ledger_sequence,
+                    "buy_op_idx": c.buy_op_idx,
+                    "victim_op_idx": c.victim_op_idx,
+                    "sell_op_idx": c.sell_op_idx,
+                },
+            }
+        )
+    return alerts
+
+
 def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
+    """Persist typed manipulation alerts.
+
+    Each alert dict must carry ``alert_type``, ``wallet``, ``asset_pair`` and a
+    JSON-serialisable ``detail`` mapping; ``pool_id`` and ``timestamp`` (ISO 8601)
+    are optional and default to ``None`` / now.
+    """
     if not alerts:
         return
     init_db(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.executemany(
             """
             INSERT INTO alerts
-                (alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (alert_type, wallet, asset_pair, pool_id, detail_json, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 (
-                    str(getattr(a["alert_type"], "value", a["alert_type"])),
+                    a["alert_type"],
                     a["wallet"],
-                    a.get("asset_pair"),
+                    a["asset_pair"],
                     a.get("pool_id"),
-                    int(a.get("severity", 0)),
-                    json.dumps(a["detail"]) if a.get("detail") is not None else None,
-                    a.get("created_at", ts),
+                    json.dumps(a.get("detail", {})),
+                    a.get("timestamp", now),
                 )
                 for a in alerts
             ],
@@ -1443,62 +1476,49 @@ def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
         conn.commit()
 
 
-def sandwich_candidates_to_alerts(candidates: list, asset_pair: str | None = None) -> list[dict]:
-    alerts: list[dict] = []
-    for c in candidates:
-        alerts.append(
-            {
-                "alert_type": AlertType.SANDWICH_ATTACK,
-                "wallet": c.attacker,
-                "asset_pair": asset_pair,
-                "pool_id": c.pool_id,
-                "severity": int(min(abs(c.slippage_inflicted) * 100, 100)),
-                "detail": {
-                    "attacker": c.attacker,
-                    "victim": c.victim,
-                    "pool_id": c.pool_id,
-                    "buy_op_idx": c.buy_op_idx,
-                    "victim_op_idx": c.victim_op_idx,
-                    "sell_op_idx": c.sell_op_idx,
-                    "profit_xlm": c.profit_xlm,
-                    "ledger_sequence": c.ledger_sequence,
-                    "slippage_inflicted": c.slippage_inflicted,
-                },
-            }
-        )
-    return alerts
-
-
 def get_alerts(
     alert_type: str | None = None,
     wallet: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     db_path: str | None = None,
 ) -> list[dict]:
+    """Return stored typed alerts, most recent first, with optional filters.
+
+    Filters by ``alert_type``, ``wallet`` and an inclusive ``[start, end]`` ISO
+    8601 timestamp window when provided.  ``detail`` is returned parsed.
+    """
     init_db(db_path)
     conditions: list[str] = []
     params: list = []
     if alert_type is not None:
         conditions.append("alert_type = ?")
-        params.append(str(getattr(alert_type, "value", alert_type)))
+        params.append(getattr(alert_type, "value", alert_type))
     if wallet is not None:
         conditions.append("wallet = ?")
         params.append(wallet)
+    if start is not None:
+        conditions.append("timestamp >= ?")
+        params.append(start)
+    if end is not None:
+        conditions.append("timestamp <= ?")
+        params.append(end)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     query = f"""
-        SELECT alert_type, wallet, asset_pair, pool_id, severity, detail_json, created_at
+        SELECT alert_type, wallet, asset_pair, pool_id, detail_json, timestamp
         FROM alerts
         {where}
-        ORDER BY created_at DESC
+        ORDER BY timestamp DESC, id DESC
     """
     if limit is not None:
         query += " LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
     with _connect(db_path) as conn:
-        rows = conn.execute(query, params).fetchall()
+        rows = conn.execute(query, tuple(params)).fetchall()
 
     return [
         {
@@ -1506,9 +1526,46 @@ def get_alerts(
             "wallet": row[1],
             "asset_pair": row[2],
             "pool_id": row[3],
-            "severity": row[4],
-            "detail": json.loads(row[5]) if row[5] else None,
-            "created_at": row[6],
+            "detail": json.loads(row[4]) if row[4] else {},
+            "timestamp": row[5],
+        }
+        for row in rows
+    ]
+
+
+def get_score_history(
+    wallet: str,
+    start: str,
+    end: str,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the risk-score time series for ``wallet`` within ``[start, end]``.
+
+    ``start`` and ``end`` are inclusive ISO 8601 timestamps.  Rows are ordered
+    oldest-first so the result reads as a chronological series, as required by
+    the regulatory export layer (`detection.compliance_exporter`).
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT wallet, asset_pair, score, benford_flag, ml_flag, confidence, timestamp
+            FROM risk_scores
+            WHERE wallet = ? AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (wallet, start, end),
+        ).fetchall()
+
+    return [
+        {
+            "wallet": row[0],
+            "asset_pair": row[1],
+            "score": row[2],
+            "benford_flag": bool(row[3]),
+            "ml_flag": bool(row[4]),
+            "confidence": row[5],
+            "timestamp": row[6],
         }
         for row in rows
     ]
