@@ -372,6 +372,25 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON path_payment_cycles (detected_at);
         """,
     ),
+    (
+        13,
+        "add analyst_feedback table for analyst review dashboard",
+        """
+        CREATE TABLE IF NOT EXISTS analyst_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            notes TEXT,
+            analyst_key_hash TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            review_started_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_wallet ON analyst_feedback (wallet);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_submitted_at ON analyst_feedback (submitted_at);
+        CREATE INDEX IF NOT EXISTS idx_analyst_feedback_verdict ON analyst_feedback (verdict);
+        """,
+    ),
 ]
 
 

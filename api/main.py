@@ -25,13 +25,21 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from api.auth import require_admin_key, require_compliance_key
+from api.analyst import router as analyst_router
 from config.settings import settings
+from detection.tracing import (
+    configure_tracing,
+    extract_context_from_headers,
+    get_tracer,
+    propagate_context_to_headers,
+    start_span,
+)
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
@@ -84,6 +92,7 @@ _models: dict = {}
 async def _lifespan(application: FastAPI):
     """Load trained models at startup; release nothing at shutdown."""
     global _models
+    configure_tracing()
     try:
         from detection.model_inference import load_models
         _models = load_models(settings.model_dir)
@@ -101,6 +110,20 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_operational_error_handler(request: Request, exc: sqlite3.OperationalError):
+    """Return 503 with Retry-After when SQLite is locked or unavailable."""
+    logger.error("SQLite operational error: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database temporarily unavailable. Please retry."},
+        headers={"Retry-After": "5"},
+    )
+
+
+app.include_router(analyst_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_allowed_origins),
@@ -108,6 +131,29 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+_tracer = get_tracer("ledgerlens.api")
+
+
+@app.middleware("http")
+async def _trace_middleware(request: Request, call_next):
+    """Extract W3C traceparent from inbound requests and start a root span."""
+    ctx = extract_context_from_headers(dict(request.headers))
+    tracer = get_tracer("ledgerlens.api")
+    span_name = f"{request.method} {request.url.path}"
+    with tracer.start_as_current_span(span_name) as span:
+        try:
+            from opentelemetry.trace import SpanKind  # type: ignore
+            span.set_attribute("http.method", request.method)
+            span.set_attribute("http.url", str(request.url))
+        except Exception:
+            pass
+        response = await call_next(request)
+        try:
+            span.set_attribute("http.status_code", response.status_code)
+        except Exception:
+            pass
+        return response
 
 
 class WebhookCreate(BaseModel):
@@ -147,21 +193,23 @@ def health() -> JSONResponse:
     healthy = True
 
     # --- DB check ---
-    try:
-        with _connect() as conn:
-            conn.execute("SELECT 1")
-        status["db"] = "ok"
-    except sqlite3.Error as exc:
-        logger.error("Health check: DB connectivity failure: %s", exc)
-        status["db"] = "error: database unreachable"
-        healthy = False
+    with start_span("db.health_check"):
+        try:
+            with _connect() as conn:
+                conn.execute("SELECT 1")
+            status["db"] = "ok"
+        except sqlite3.Error as exc:
+            logger.error("Health check: DB connectivity failure: %s", exc)
+            status["db"] = "error: database unreachable"
+            healthy = False
 
     # --- Model files check (existence + non-zero size only; no deserialization) ---
-    missing = [
-        name
-        for name, filename in _MODEL_FILENAMES.items()
-        if not _model_file_ok(os.path.join(settings.model_dir, filename))
-    ]
+    with start_span("models.health_check"):
+        missing = [
+            name
+            for name, filename in _MODEL_FILENAMES.items()
+            if not _model_file_ok(os.path.join(settings.model_dir, filename))
+        ]
     if missing:
         status["models"] = f"missing: {', '.join(sorted(missing))}"
         healthy = False
@@ -241,7 +289,8 @@ def explain_wallet_score(
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     validate_stellar_address(wallet)
-    cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
+    with start_span("redis.shap_lookup", attributes={"wallet": wallet, "asset_pair": asset_pair}):
+        cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
     if cached is None:
         raise HTTPException(
             status_code=404,
@@ -290,7 +339,8 @@ def wallet_counterfactual(
     from detection.model_inference import score_feature_vector
 
     resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
-    current_probability, _confidence = score_feature_vector(_models, feature_vector)
+    with start_span("model.inference", attributes={"wallet": wallet}):
+        current_probability, _confidence = score_feature_vector(_models, feature_vector)
     current_score = round(current_probability * 100)
 
     future = _counterfactual_executor.submit(
