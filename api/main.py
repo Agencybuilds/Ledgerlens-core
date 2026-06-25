@@ -595,6 +595,17 @@ def federated_audit_log(
     return get_audit_records(limit=limit)
 
 
+@app.get("/admin/namespaces", dependencies=[Depends(require_admin_key)])
+def admin_namespaces() -> list[dict]:
+    """Return every namespace with per-table record counts.
+
+    Admin-only (requires the ``LEDGERLENS_ADMIN_API_KEY`` header).
+    Gated by `require_admin_key` — the admin wildcard API key is
+    required to see cross-namespace data.
+    """
+    return list_namespaces()
+
+
 # ---------------------------------------------------------------------------
 # Model weights
 # ---------------------------------------------------------------------------
