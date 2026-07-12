@@ -221,6 +221,51 @@ FEATURE_CONSTRAINTS: list[FeatureConstraint] = [
     # cross_chain_round_trip_score: lowering this reduces cross-chain
     # round-trip detection signal.
     _decreasable("cross_chain_round_trip_score"),
+
+    # --- Benford stratification features (25) --------------------------------
+    # max_stratum_chi2/MAD are the worst-case per-stratum goodness-of-fit
+    # deviation and n_flagged_strata is a count of anomalous strata -- all
+    # three default to 0.0 (no deviation) and rise with more artificially
+    # engineered amounts, so they are decreasable like the top-level Benford
+    # features above.
+    *(_decreasable(f"max_stratum_chi2_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    *(_decreasable(f"max_stratum_MAD_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    *(_decreasable(f"n_flagged_strata_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    # ks_stat/kuiper_stat are Kolmogorov-Smirnov/Kuiper test statistics
+    # (default 0.0, rise with deviation from Benford's Law) -- decreasable.
+    # The paired p-values default to 1.0 (no evidence of deviation) and fall
+    # as deviation grows, so suspicion is reduced by *raising* them, capped
+    # at 1.0, mirroring benford_copula_pval below.
+    *(_decreasable(f"ks_stat_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    *(_increasable(f"ks_pval_{w}", max_val=1.0) for w in ("1h", "4h", "24h", "7d", "30d")),
+    *(_decreasable(f"kuiper_stat_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+    *(_increasable(f"kuiper_pval_{w}", max_val=1.0) for w in ("1h", "4h", "24h", "7d", "30d")),
+    # benford_combined_flag_* is a derived {0, 1} flag set when >= 2 of the
+    # stratification/KS/Kuiper signals above are independently flagged; it
+    # falls out of those same decreasable signals, so it is decreasable too.
+    *(_decreasable(f"benford_combined_flag_{w}") for w in ("1h", "4h", "24h", "7d", "30d")),
+
+    # --- AMM session-tracker features (2) ------------------------------------
+    # amm_volume_concentration is the classic "more = more suspicious" pool-
+    # manipulation ratio, like pool_share_concentration above -- decreasable.
+    # amm_tenure_ratio is the *opposite*: it is the fraction of the max
+    # tracked tenure a flagged AMM session was held for, and short tenure
+    # (rapid deposit/withdraw) is the suspicious pattern, so a wallet reduces
+    # suspicion by holding positions *longer*, i.e. raising this ratio,
+    # capped at its natural ceiling of 1.0.
+    _increasable("amm_tenure_ratio", max_val=1.0),
+    _decreasable("amm_volume_concentration"),
+
+    # --- GNN raw probability (1) ---------------------------------------------
+    # gnn_wash_ring_prob is the same GNN ring-membership probability as
+    # gnn_wash_ring_probability above, populated directly from the batch
+    # scorer -- decreasable for the same reason.
+    _decreasable("gnn_wash_ring_prob"),
+
+    # --- Adversarial composite (1) --------------------------------------------
+    # adversarial_feature_score is a direct copy of evasion_composite_score
+    # (see detection/feature_engineering.py); same constraint applies.
+    _decreasable("adversarial_feature_score"),
 ]
 
 _missing = set(FEATURE_NAMES) - {c.feature_name for c in FEATURE_CONSTRAINTS}
