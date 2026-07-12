@@ -484,9 +484,9 @@ Returns **HTTP 503** when any check fails, naming the failing component:
 The response body never contains raw filesystem paths or exception text —
 errors are logged server-side at `ERROR` level via `logger.exception`.
 
-> The production API, dashboard, and Soroban contract live in their
-> respective repos (`ledgerlens-api`, `ledgerlens-dashboard`,
-> `ledgerlens-contracts`).
+> The API and Soroban/oracle contracts are part of this repo (`api/`,
+> `contracts/`). Only the dashboard lives in a separate repo
+> (`ledgerlens-dashboard`).
 
 ### Docker
 
