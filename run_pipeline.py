@@ -175,22 +175,54 @@ def run(
     and includes conformal prediction intervals in the returned scores.
     Falls back silently if no calibration artifacts are found.
     """
-    asset_pairs = asset_pairs or [
-        (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
-    ]
-    models = load_models()
-    calibrators = load_calibration() if use_uncertainty else {}
-    scores: list[RiskScore] = []
-    all_rings: list[dict] = []
-    scored_features: list[dict] = []
-    scored_wallets: list[str] = []
-    scored_pairs: list[str] = []
+    # Assign a fresh correlation ID for this pipeline pass
+    set_correlation_id(str(uuid.uuid4()))
 
-    # Pre-load all trades when running in multi-pair mode
-    trades_by_pair: dict[str, pd.DataFrame] = {}
-    correlated_pairs: list[tuple[str, str, float]] = []
-    cross_pair_wallets_map: dict[str, list[str]] = {}
-    all_rings: list[dict] = []
+    from api.metrics import pipeline_run_duration_seconds, wallets_scored_total, scoring_latency_seconds
+
+    tracer = get_tracer("ledgerlens.pipeline")
+    _t_start = time.monotonic()
+
+    with tracer.start_as_current_span("pipeline.run") as span:
+        asset_pairs = asset_pairs or [
+            (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+        ]
+        span.set_attribute("pipeline.pair_count", len(asset_pairs))
+
+        models = load_models()
+        calibrators = load_calibration() if use_uncertainty else {}
+        scores: list[RiskScore] = []
+        all_rings: list[dict] = []
+        scored_features: list[dict] = []
+        scored_wallets: list[str] = []
+        scored_pairs: list[str] = []
+
+        # Pre-load all trades when running in multi-pair mode
+        trades_by_pair: dict[str, pd.DataFrame] = {}
+        correlated_pairs: list[tuple[str, str, float]] = []
+        cross_pair_wallets_map: dict[str, list[str]] = {}
+
+        if multi_pair:
+            for base_asset, counter_asset in asset_pairs:
+                pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+                trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+                if not trades.empty:
+                    trades_by_pair[pair_key] = trades
+
+            if trades_by_pair:
+                volume_matrix = build_volume_time_series(trades_by_pair)
+                correlated_pairs = find_correlated_pairs(volume_matrix)
+                cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
+
+                shared_counts: dict[tuple[str, str], int] = {}
+                for pa, pb, _ in correlated_pairs:
+                    count = sum(
+                        1 for w_pairs in cross_pair_wallets_map.values()
+                        if pa in w_pairs and pb in w_pairs
+                    )
+                    shared_counts[(pa, pb)] = count
+                save_pair_correlations(correlated_pairs, "spearman", shared_counts)
+                logger.info("Found %d correlated pair combinations", len(correlated_pairs))
 
         for base_asset, counter_asset in asset_pairs:
             pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
@@ -200,114 +232,45 @@ def run(
             else:
                 trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
 
-        if multi_pair:
-            trades = trades_by_pair.get(pair_key, pd.DataFrame())
-        else:
-            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+            if trades.empty:
+                logger.info("No trades found for %s/%s", base_asset, counter_asset)
+                continue
 
-        if trades.empty:
-            logger.info("No trades found for %s/%s", base_asset, counter_asset)
-            continue
-
-        # Merge Solana SPL swap trades (when SOLANA_RPC_URL is configured) so
-        # cross-chain Stellar↔Solana wallets flow through the same feature store.
-        stellar_accounts_list = list(
-            pd.unique(trades[["base_account", "counter_account"]].values.ravel())
-        )
-        stellar_accounts_list = [a for a in stellar_accounts_list if a is not None and pd.notna(a)]
-        solana_df = _ingest_solana_trades(stellar_accounts_list)
-        if not solana_df.empty:
-            trades = pd.concat([trades, solana_df], ignore_index=True)
-
-        as_of = pd.Timestamp(trades["ledger_close_time"].max())
-        graph = build_transaction_graph(trades)
-        rings = find_wash_rings(graph)
-        all_rings.extend(rings)
-        ring_membership = build_ring_membership_index(rings, trades=trades)
-        # GNN scoring — optional; degrades to 0.0 if torch_geometric not installed
-        _gnn_engine = load_gnn_engine(settings.model_dir)
-        if _gnn_engine is not None:
-            GNNInferenceEngine.set_instance(_gnn_engine)
-        gnn_scores: dict[str, float] = {}
-        try:
-            if _gnn_engine is not None:
-                gnn_scores = _gnn_engine.score_graph(graph)
-        except Exception:
-            logger.exception("GNN scoring failed; using 0.0 for gnn_wash_ring_prob")
-        _ring_membership = build_ring_membership_index(rings, trades=trades)
-        accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
-        accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
-        account_metadata = load_account_metadata(list(accounts))
-        since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
-        all_order_book_events = load_order_book_events_for_pair(
-            base_asset,
-            counter_asset,
-            since=since,
-        )
-        order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
-
-        if "trade_type" in trades.columns:
-            pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
-            save_liquidity_pool_trades(pool_trades)
-
-        path_payments = load_path_payments_for_accounts(list(accounts), since)
-        save_path_payments(path_payments)
-        circular_routes = detect_atomic_circular_routes(path_payments)
-        save_circular_routes(circular_routes)
-        path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
-        save_path_payment_cycles(path_cycles)
-        save_alerts(path_payment_cycles_to_alerts(path_cycles))
-
-        for account in accounts:
-            features = build_feature_vector(
-                trades,
-                account,
-                as_of,
-                order_book_events=order_book_events,
-                account_metadata=account_metadata,
-                trades_by_pair=trades_by_pair if multi_pair else None,
-                correlated_pairs=correlated_pairs if multi_pair else None,
-                cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
-                path_payments=path_payments,
-                gnn_scores=gnn_scores,
-                path_cycles=path_cycles,
-                ring_membership=_ring_membership,
+            # Merge Solana SPL swap trades (when SOLANA_RPC_URL is configured) so
+            # cross-chain Stellar↔Solana wallets flow through the same feature store.
+            stellar_accounts_list = list(
+                pd.unique(trades[["base_account", "counter_account"]].values.ravel())
             )
-            if calibrators:
-                uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
-                probability = uncertainty["score"] / 100.0
-                _, confidence = score_feature_vector(models, features)
-                score = RiskScore.combine(
-                    wallet=account,
-                    asset_pair=pair_key,
-                    benford_mad=features.get("benford_mad_24h", 0.0),
-                    benford_mad_threshold=settings.benford_mad_threshold,
-                    ml_probability=probability,
-                    ml_confidence=confidence,
-                    score_lower=uncertainty["score_lower"],
-                    score_upper=uncertainty["score_upper"],
-                    prediction_set=uncertainty.get("prediction_set"),
-                    coverage_guarantee=uncertainty.get("coverage_guarantee"),
-                    sandwich_signal=features.get("pdc_5m", 0.0),
-                    sandwich_weight=settings.pdc_discount_weight,
-                )
-            else:
-                probability, confidence = score_feature_vector(models, features)
-                score = RiskScore.combine(
-                    wallet=account,
-                    asset_pair=pair_key,
-                    benford_mad=features.get("benford_mad_24h", 0.0),
-                    benford_mad_threshold=settings.benford_mad_threshold,
-                    ml_probability=probability,
-                    ml_confidence=confidence,
-                    sandwich_signal=features.get("pdc_5m", 0.0),
-                    sandwich_weight=settings.pdc_discount_weight,
-                )
-            adjust_score_with_temporal(account, pair_key, score, models)
-            scores.append(score)
-            scored_features.append(features)
-            scored_wallets.append(account)
-            scored_pairs.append(pair_key)
+            stellar_accounts_list = [a for a in stellar_accounts_list if a is not None and pd.notna(a)]
+            solana_df = _ingest_solana_trades(stellar_accounts_list)
+            if not solana_df.empty:
+                trades = pd.concat([trades, solana_df], ignore_index=True)
+
+            as_of = pd.Timestamp(trades["ledger_close_time"].max())
+            graph = build_transaction_graph(trades)
+            rings = find_wash_rings(graph)
+            all_rings.extend(rings)
+            ring_membership = build_ring_membership_index(rings, trades=trades)
+            # GNN scoring — optional; degrades to 0.0 if torch_geometric not installed
+            _gnn_engine = load_gnn_engine(settings.model_dir)
+            if _gnn_engine is not None:
+                GNNInferenceEngine.set_instance(_gnn_engine)
+            gnn_scores: dict[str, float] = {}
+            try:
+                if _gnn_engine is not None:
+                    gnn_scores = _gnn_engine.score_graph(graph)
+            except Exception:
+                logger.exception("GNN scoring failed; using 0.0 for gnn_wash_ring_prob")
+            accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+            accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
+            account_metadata = load_account_metadata(list(accounts))
+            since = as_of.to_pydatetime() - timedelta(days=settings.trade_history_lookback_days)
+            all_order_book_events = load_order_book_events_for_pair(
+                base_asset,
+                counter_asset,
+                since=since,
+            )
+            order_book_events = pd.DataFrame([e.model_dump() for e in all_order_book_events])
 
             if "trade_type" in trades.columns:
                 pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
@@ -317,18 +280,57 @@ def run(
             save_path_payments(path_payments)
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
+            path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
+            save_path_payment_cycles(path_cycles)
+            save_alerts(path_payment_cycles_to_alerts(path_cycles))
 
-    save_scores(scores)
-    save_rings(all_rings)
-
-                score = RiskScore.combine(
-                    wallet=account,
-                    asset_pair=pair_key,
-                    benford_mad=features.get("benford_mad_24h", 0.0),
-                    benford_mad_threshold=settings.benford_mad_threshold,
-                    ml_probability=probability,
-                    ml_confidence=confidence,
+            for account in accounts:
+                _t_acct = time.monotonic()
+                features = build_feature_vector(
+                    trades,
+                    account,
+                    as_of,
+                    order_book_events=order_book_events,
+                    account_metadata=account_metadata,
+                    trades_by_pair=trades_by_pair if multi_pair else None,
+                    correlated_pairs=correlated_pairs if multi_pair else None,
+                    cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
+                    path_payments=path_payments,
+                    gnn_scores=gnn_scores,
+                    path_cycles=path_cycles,
+                    ring_membership=ring_membership,
                 )
+                if calibrators:
+                    uncertainty = score_with_uncertainty(models, features, calibrators=calibrators)
+                    probability = uncertainty["score"] / 100.0
+                    _, confidence = score_feature_vector(models, features)
+                    score = RiskScore.combine(
+                        wallet=account,
+                        asset_pair=pair_key,
+                        benford_mad=features.get("benford_mad_24h", 0.0),
+                        benford_mad_threshold=settings.benford_mad_threshold,
+                        ml_probability=probability,
+                        ml_confidence=confidence,
+                        score_lower=uncertainty["score_lower"],
+                        score_upper=uncertainty["score_upper"],
+                        prediction_set=uncertainty.get("prediction_set"),
+                        coverage_guarantee=uncertainty.get("coverage_guarantee"),
+                        sandwich_signal=features.get("pdc_5m", 0.0),
+                        sandwich_weight=settings.pdc_discount_weight,
+                    )
+                else:
+                    probability, confidence = score_feature_vector(models, features)
+                    score = RiskScore.combine(
+                        wallet=account,
+                        asset_pair=pair_key,
+                        benford_mad=features.get("benford_mad_24h", 0.0),
+                        benford_mad_threshold=settings.benford_mad_threshold,
+                        ml_probability=probability,
+                        ml_confidence=confidence,
+                        sandwich_signal=features.get("pdc_5m", 0.0),
+                        sandwich_weight=settings.pdc_discount_weight,
+                    )
+                adjust_score_with_temporal(account, pair_key, score, models)
                 scores.append(score)
                 scored_features.append(features)
                 scored_wallets.append(account)
@@ -349,6 +351,7 @@ def run(
                 logger.exception("Failed to record scored features for drift detection")
 
         save_scores(scores)
+        save_rings(all_rings)
 
         # Persist feature vectors and compute+cache SHAP values using XGBoost model.
         if scored_features:
