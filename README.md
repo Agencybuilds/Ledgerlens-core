@@ -1027,7 +1027,7 @@ If you change a field name, type, or range here, update the Rust struct in `ledg
 
 For issues and questions:
 
-- GitHub Issues: [Create an issue](https://github.com/yourusername/ledgerlens/issues)
+- GitHub Issues: [Create an issue](https://github.com/Ledger-Lenz/Ledgerlens-core/issues)
 - Stellar Discord: https://discord.gg/stellar
 
 ## References
