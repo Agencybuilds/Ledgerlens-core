@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from ingestion.http_client import AsyncHorizonClient, get_with_retry
+from ingestion.http_client import AsyncHorizonClient, MaxRetriesExceededError, get_with_retry
 
 
 def _client_with_handler(handler) -> httpx.Client:
@@ -73,6 +73,7 @@ def _make_mock_response(status_code: int, body: dict | None = None) -> MagicMock
     resp.status_code = status_code
     resp.json.return_value = body or {}
     resp.request = MagicMock()
+    resp.headers = {}
     if status_code >= 400:
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
             f"HTTP {status_code}", request=resp.request, response=resp
@@ -129,7 +130,7 @@ async def test_async_client_raises_after_exhausting_retries():
     _patch_client_get(client, mock_get)
 
     with patch("ingestion.http_client.asyncio.sleep"):
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(MaxRetriesExceededError):
             await client.get("/trades")
 
     await client.close()
