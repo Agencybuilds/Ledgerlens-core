@@ -42,6 +42,8 @@ At a high level, it does three things:
 - **On-Chain Risk Registry**: Soroban smart contract exposes risk scores so AMMs, lending protocols, and aggregators can gate suspicious activity natively
 - **Public REST API**: Query scores, recent alerts, and asset risk rankings
 - **Lightweight Dashboard**: Web UI for risk-score visibility without requiring technical expertise
+- **GNN Ring Detection**: Graph neural network classifier that scores wash-trading ring membership directly from the trade graph, complementing the SCC-based detector (see [docs/gnn_ring_detection.md](docs/gnn_ring_detection.md))
+- **Federated Learning**: Privacy-preserving cross-deployment model training with Krum Byzantine-resilient aggregation and differential privacy (see [docs/federated_learning.md](docs/federated_learning.md))
 
 - Adversarial robustness evaluation: attack, certificate, and hardening tools (see docs/adversarial_robustness.md)
 
